@@ -1,0 +1,497 @@
+{% extends "base.html" %}
+{% block title %}Grabaciones — CamRecorder{% endblock %}
+
+{% block head %}
+<style>
+  /* ══════════════════════════════════════════════
+     RECORDINGS — Vista de archivos
+  ══════════════════════════════════════════════ */
+  .rec-layout {
+    display: flex;
+    flex: 1;
+    overflow: hidden;
+  }
+
+  /* ── Sidebar de cámaras ─────────────────── */
+  .rec-sidebar {
+    width: 230px;
+    flex-shrink: 0;
+    background: var(--panel);
+    border-right: 1px solid var(--border);
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+  }
+  .rec-sidebar-hdr {
+    padding: 14px 16px 10px;
+    border-bottom: 1px solid var(--border);
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: .12em;
+    color: var(--text-dim);
+    text-transform: uppercase;
+  }
+  .cam-list { flex: 1; }
+  .cam-list-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 16px;
+    text-decoration: none;
+    color: var(--text);
+    font-size: 13px;
+    font-weight: 500;
+    border-left: 2px solid transparent;
+    transition: all .15s;
+  }
+  .cam-list-item:hover { background: var(--bg3); color: var(--text-bright); }
+  .cam-list-item.active {
+    border-left-color: var(--green);
+    background: var(--green-glow);
+    color: var(--green);
+  }
+  .cam-list-item .cam-icon {
+    width: 7px; height: 7px;
+    border-radius: 50%;
+    background: var(--green-dim);
+    flex-shrink: 0;
+  }
+  .cam-list-item .cam-meta {
+    margin-left: auto;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 1px;
+  }
+  .cam-list-item .cam-count {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--text-dim);
+  }
+  .cam-list-item .cam-size {
+    font-family: var(--mono);
+    font-size: 9px;
+    color: var(--text-dim);
+    opacity: .7;
+  }
+  .cam-list-item.active .cam-count,
+  .cam-list-item.active .cam-size { color: var(--green-dim); }
+
+  /* ── Panel principal ────────────────────── */
+  .rec-main {
+    flex: 1;
+    overflow-y: auto;
+    padding: 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+  }
+
+  /* Cabecera del panel */
+  .rec-main-hdr {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+  }
+  .rec-main-hdr h2 {
+    font-family: var(--mono);
+    font-size: 14px;
+    color: var(--green);
+    letter-spacing: .1em;
+    text-transform: uppercase;
+  }
+  .rec-main-hdr .line { flex: 1; height: 1px; background: var(--border); }
+  .rec-main-hdr .total {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--text-dim);
+    letter-spacing: .06em;
+  }
+
+  /* Filtro de búsqueda */
+  .rec-search {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .search-input {
+    flex: 1;
+    max-width: 320px;
+    background: var(--bg3);
+    border: 1px solid var(--border);
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 12px;
+    padding: 7px 12px;
+    border-radius: 2px;
+    outline: none;
+    transition: border-color .2s;
+  }
+  .search-input:focus { border-color: var(--green-dim); }
+  .search-input::placeholder { color: var(--text-dim); }
+
+  /* Tabla de archivos */
+  .files-table {
+    width: 100%;
+    border-collapse: collapse;
+  }
+  .files-table thead tr {
+    border-bottom: 1px solid var(--border);
+  }
+  .files-table th {
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: .12em;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    text-align: left;
+    padding: 8px 12px;
+    font-weight: 400;
+  }
+  .files-table td {
+    padding: 9px 12px;
+    border-bottom: 1px solid rgba(26,45,58,.5);
+    vertical-align: middle;
+    font-size: 13px;
+  }
+  .files-table tbody tr:hover { background: var(--bg3); }
+
+  .file-name {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--text-bright);
+  }
+  .file-date { color: var(--text-dim); font-size: 12px; }
+  .file-size {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--text-dim);
+    text-align: right;
+    white-space: nowrap;
+  }
+  .file-actions {
+    display: flex;
+    gap: 6px;
+    justify-content: flex-end;
+  }
+  .btn-play, .btn-dl {
+    padding: 4px 12px;
+    border-radius: 2px;
+    font-family: var(--mono);
+    font-size: 11px;
+    cursor: pointer;
+    text-decoration: none;
+    transition: all .15s;
+    letter-spacing: .04em;
+  }
+  .btn-play {
+    background: var(--green-glow);
+    border: 1px solid var(--green-dim);
+    color: var(--green);
+  }
+  .btn-play:hover { background: rgba(0,230,118,.3); }
+  .btn-dl {
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--text-dim);
+  }
+  .btn-dl:hover { border-color: var(--amber); color: var(--amber); }
+
+  /* Paginación */
+  .pagination {
+    display: flex;
+    gap: 6px;
+    justify-content: center;
+    padding-top: 8px;
+  }
+  .page-btn {
+    padding: 4px 10px;
+    border: 1px solid var(--border);
+    background: transparent;
+    color: var(--text-dim);
+    font-family: var(--mono);
+    font-size: 11px;
+    cursor: pointer;
+    border-radius: 2px;
+    transition: all .15s;
+  }
+  .page-btn:hover, .page-btn.active {
+    border-color: var(--green);
+    color: var(--green);
+    background: var(--green-glow);
+  }
+
+  /* Estado vacío */
+  .empty-state {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 80px 20px;
+    gap: 12px;
+    color: var(--text-dim);
+  }
+  .empty-state .icon { font-size: 40px; opacity: .25; }
+  .empty-state p { font-family: var(--mono); font-size: 12px; letter-spacing: .08em; }
+
+  /* Resumen inicial */
+  .summary-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+    gap: 10px;
+  }
+  .summary-card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 2px;
+    padding: 14px 16px;
+    text-decoration: none;
+    color: var(--text);
+    transition: all .18s;
+    display: block;
+  }
+  .summary-card:hover {
+    border-color: var(--green-dim);
+    background: var(--bg3);
+    transform: translateY(-1px);
+  }
+  .summary-card-name {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--green);
+    letter-spacing: .06em;
+    margin-bottom: 8px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .summary-card-name::before {
+    content: '';
+    width: 6px; height: 6px;
+    background: var(--green);
+    border-radius: 50%;
+    box-shadow: 0 0 6px var(--green);
+  }
+  .summary-card-stats {
+    display: flex;
+    justify-content: space-between;
+    font-size: 12px;
+    color: var(--text-dim);
+    font-family: var(--mono);
+  }
+
+  /* Video player modal */
+  .player-modal {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,.95);
+    z-index: 300;
+    align-items: center;
+    justify-content: center;
+    flex-direction: column;
+    gap: 12px;
+  }
+  .player-modal.open { display: flex; }
+  .player-wrap {
+    position: relative;
+    max-width: 90vw;
+    border: 1px solid var(--green);
+    box-shadow: 0 0 40px var(--green-glow);
+  }
+  .player-wrap video {
+    display: block;
+    max-width: 90vw;
+    max-height: 80vh;
+  }
+  .player-info {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--green-dim);
+    letter-spacing: .06em;
+    text-align: center;
+  }
+  .player-close {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--text-dim);
+    background: none;
+    border: 1px solid var(--border);
+    padding: 4px 14px;
+    cursor: pointer;
+    border-radius: 2px;
+    letter-spacing: .08em;
+    transition: all .15s;
+  }
+  .player-close:hover { border-color: var(--red); color: var(--red); }
+</style>
+{% endblock %}
+
+{% block body %}
+<div class="rec-layout">
+
+  <!-- Sidebar -->
+  <aside class="rec-sidebar">
+    <div class="rec-sidebar-hdr">Cámaras</div>
+    <div class="cam-list">
+      {% if summary %}
+        {% for cam in summary %}
+        <a href="/recordings/{{ cam.name }}"
+           class="cam-list-item {% if selected == cam.name %}active{% endif %}">
+          <div class="cam-icon"></div>
+          <span>{{ cam.name }}</span>
+          <div class="cam-meta">
+            <span class="cam-count">{{ cam.count }} arch.</span>
+            <span class="cam-size">{{ cam.total }}</span>
+          </div>
+        </a>
+        {% endfor %}
+      {% else %}
+        <div style="padding:20px 16px;font-family:var(--mono);font-size:11px;color:var(--text-dim);">
+          Sin grabaciones todavía
+        </div>
+      {% endif %}
+    </div>
+  </aside>
+
+  <!-- Main panel -->
+  <main class="rec-main">
+
+    {% if selected and files is not none %}
+    <!-- ── Vista de archivos de una cámara ── -->
+    <div class="rec-main-hdr">
+      <h2>📁 {{ selected }}</h2>
+      <div class="line"></div>
+      <span class="total">{{ files|length }} archivo{% if files|length != 1 %}s{% endif %}</span>
+    </div>
+
+    <!-- Búsqueda -->
+    <div class="rec-search">
+      <input class="search-input" type="text" id="search-input"
+             placeholder="Filtrar por fecha o nombre..." oninput="filterFiles()" />
+    </div>
+
+    {% if files %}
+    <table class="files-table" id="files-table">
+      <thead>
+        <tr>
+          <th>Archivo</th>
+          <th>Fecha</th>
+          <th style="text-align:right">Tamaño</th>
+          <th style="text-align:right">Acciones</th>
+        </tr>
+      </thead>
+      <tbody id="files-tbody">
+        {% for f in files %}
+        <tr data-name="{{ f.name }}" data-date="{{ f.date }}">
+          <td class="file-name">{{ f.name }}</td>
+          <td class="file-date">{{ f.date }}</td>
+          <td class="file-size">{{ f.size }}</td>
+          <td>
+            <div class="file-actions">
+              <button class="btn-play"
+                onclick="playVideo('/download/{{ selected }}/{{ f.name }}', '{{ f.name }}')">
+                ▶ Reproducir
+              </button>
+              <a class="btn-dl"
+                href="/download/{{ selected }}/{{ f.name }}?dl=1"
+                download="{{ f.name }}">
+                ↓ Descargar
+              </a>
+            </div>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <div class="empty-state">
+      <div class="icon">📂</div>
+      <p>No hay grabaciones para <strong>{{ selected }}</strong> todavía.</p>
+      <p>Las grabaciones aparecerán aquí cuando se generen segmentos de 1 hora.</p>
+    </div>
+    {% endif %}
+
+    {% elif summary %}
+    <!-- ── Vista resumen (selecciona cámara) ── -->
+    <div class="rec-main-hdr">
+      <h2>⏺ Todas las grabaciones</h2>
+      <div class="line"></div>
+      <span class="total">{{ summary|length }} cámara{% if summary|length != 1 %}s{% endif %}</span>
+    </div>
+    <div class="summary-grid">
+      {% for cam in summary %}
+      <a href="/recordings/{{ cam.name }}" class="summary-card">
+        <div class="summary-card-name">{{ cam.name }}</div>
+        <div class="summary-card-stats">
+          <span>{{ cam.count }} archivos</span>
+          <span>{{ cam.total }}</span>
+        </div>
+      </a>
+      {% endfor %}
+    </div>
+
+    {% else %}
+    <!-- ── Sin grabaciones ── -->
+    <div class="empty-state">
+      <div class="icon">🎞️</div>
+      <p>No hay grabaciones disponibles aún.</p>
+      <p>El grabador crea un nuevo archivo cada hora por cámara.</p>
+    </div>
+    {% endif %}
+
+  </main>
+</div>
+
+<!-- Video Player Modal -->
+<div class="player-modal" id="player-modal">
+  <div class="player-wrap">
+    <video id="player-video" controls autoplay>
+      Tu navegador no soporta video HTML5.
+    </video>
+  </div>
+  <div class="player-info" id="player-info"></div>
+  <button class="player-close" onclick="closePlayer()">[ ESC ] CERRAR</button>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+  // ── Filtro de archivos ───────────────────
+  function filterFiles() {
+    const q = document.getElementById('search-input').value.toLowerCase();
+    document.querySelectorAll('#files-tbody tr').forEach(row => {
+      const name = row.dataset.name?.toLowerCase() || '';
+      const date = row.dataset.date?.toLowerCase() || '';
+      row.style.display = (name.includes(q) || date.includes(q)) ? '' : 'none';
+    });
+  }
+
+  // ── Reproductor modal ─────────────────
+  function playVideo(url, name) {
+    const modal = document.getElementById('player-modal');
+    const video = document.getElementById('player-video');
+    const info  = document.getElementById('player-info');
+    video.src = url;
+    info.textContent = name;
+    modal.classList.add('open');
+    video.play().catch(() => {});
+  }
+
+  function closePlayer() {
+    const modal = document.getElementById('player-modal');
+    const video = document.getElementById('player-video');
+    video.pause();
+    video.src = '';
+    modal.classList.remove('open');
+  }
+
+  document.getElementById('player-modal')?.addEventListener('click', e => {
+    if (e.target === e.currentTarget) closePlayer();
+  });
+
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape') closePlayer();
+  });
+</script>
+{% endblock %}

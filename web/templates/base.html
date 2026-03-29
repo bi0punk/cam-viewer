@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>{% block title %}CamRecorder{% endblock %}</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Rajdhani:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <style>
+    /* ══════════════════════════════════════════════
+       VARIABLES — Paleta CCTV / sala de control
+    ══════════════════════════════════════════════ */
+    :root {
+      --bg:           #080c0f;
+      --bg2:          #0d1318;
+      --bg3:          #111920;
+      --panel:        #0f171e;
+      --border:       #1a2d3a;
+      --border-bright:#24404f;
+      --green:        #00e676;
+      --green-dim:    #00b050;
+      --green-glow:   rgba(0,230,118,.18);
+      --amber:        #ffab00;
+      --red:          #ff3d3d;
+      --blue:         #00b4ff;
+      --text:         #c8dde8;
+      --text-dim:     #5a7a8a;
+      --text-bright:  #e8f4ff;
+      --mono:         'Share Tech Mono', monospace;
+      --sans:         'Rajdhani', sans-serif;
+    }
+
+    /* ══════════════════════════════════════════════
+       RESET & BASE
+    ══════════════════════════════════════════════ */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { height: 100%; }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--sans);
+      font-size: 15px;
+      line-height: 1.5;
+      display: flex;
+      flex-direction: column;
+      min-height: 100vh;
+    }
+
+    /* Noise texture overlay */
+    body::before {
+      content: '';
+      position: fixed; inset: 0;
+      background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.03'/%3E%3C/svg%3E");
+      pointer-events: none;
+      z-index: 9999;
+      opacity: .6;
+    }
+
+    /* ══════════════════════════════════════════════
+       TOPBAR
+    ══════════════════════════════════════════════ */
+    .topbar {
+      display: flex;
+      align-items: center;
+      gap: 24px;
+      padding: 0 24px;
+      height: 56px;
+      background: var(--panel);
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+      position: sticky;
+      top: 0;
+      z-index: 100;
+    }
+
+    .topbar-logo {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      text-decoration: none;
+    }
+    .topbar-logo .icon {
+      width: 28px; height: 28px;
+      background: var(--green);
+      border-radius: 50%;
+      display: flex; align-items: center; justify-content: center;
+      box-shadow: 0 0 12px var(--green-glow);
+      flex-shrink: 0;
+    }
+    .topbar-logo .icon svg { width: 14px; height: 14px; fill: #000; }
+    .topbar-logo span {
+      font-family: var(--mono);
+      font-size: 13px;
+      color: var(--green);
+      letter-spacing: .08em;
+      text-transform: uppercase;
+    }
+
+    .topbar-nav {
+      display: flex;
+      gap: 4px;
+      margin-left: 8px;
+    }
+    .nav-btn {
+      padding: 6px 18px;
+      border: 1px solid var(--border);
+      background: transparent;
+      color: var(--text-dim);
+      font-family: var(--sans);
+      font-size: 13px;
+      font-weight: 600;
+      letter-spacing: .06em;
+      text-transform: uppercase;
+      text-decoration: none;
+      cursor: pointer;
+      transition: all .18s;
+      border-radius: 2px;
+    }
+    .nav-btn:hover { border-color: var(--green-dim); color: var(--green); }
+    .nav-btn.active {
+      background: var(--green-glow);
+      border-color: var(--green);
+      color: var(--green);
+    }
+
+    .topbar-right {
+      margin-left: auto;
+      display: flex;
+      align-items: center;
+      gap: 16px;
+    }
+    .clock {
+      font-family: var(--mono);
+      font-size: 13px;
+      color: var(--text-dim);
+      letter-spacing: .04em;
+    }
+    .rec-dot {
+      width: 8px; height: 8px;
+      background: var(--red);
+      border-radius: 50%;
+      animation: blink 1.4s ease-in-out infinite;
+    }
+    @keyframes blink { 0%,100%{opacity:1} 50%{opacity:.2} }
+
+    /* ══════════════════════════════════════════════
+       LAYOUT
+    ══════════════════════════════════════════════ */
+    .layout {
+      display: flex;
+      flex: 1;
+      overflow: hidden;
+    }
+
+    /* Sidebar (solo grabaciones) */
+    .sidebar {
+      width: 220px;
+      flex-shrink: 0;
+      background: var(--panel);
+      border-right: 1px solid var(--border);
+      overflow-y: auto;
+      padding: 12px 0;
+    }
+    .sidebar-title {
+      font-family: var(--mono);
+      font-size: 10px;
+      letter-spacing: .14em;
+      color: var(--text-dim);
+      text-transform: uppercase;
+      padding: 4px 16px 12px;
+    }
+    .sidebar-item {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 9px 16px;
+      text-decoration: none;
+      color: var(--text);
+      font-size: 13px;
+      font-weight: 500;
+      border-left: 2px solid transparent;
+      transition: all .15s;
+    }
+    .sidebar-item:hover { background: var(--bg3); color: var(--text-bright); }
+    .sidebar-item.active {
+      border-left-color: var(--green);
+      background: var(--green-glow);
+      color: var(--green);
+    }
+    .sidebar-item .badge {
+      margin-left: auto;
+      font-family: var(--mono);
+      font-size: 10px;
+      color: var(--text-dim);
+    }
+    .sidebar-item .cam-dot {
+      width: 6px; height: 6px;
+      background: var(--green-dim);
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+
+    /* Main content */
+    .main {
+      flex: 1;
+      overflow-y: auto;
+      padding: 20px;
+    }
+
+    /* ══════════════════════════════════════════════
+       SECTION HEADER
+    ══════════════════════════════════════════════ */
+    .section-hdr {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 20px;
+    }
+    .section-hdr h1 {
+      font-family: var(--mono);
+      font-size: 14px;
+      letter-spacing: .1em;
+      color: var(--green);
+      text-transform: uppercase;
+    }
+    .section-hdr .line {
+      flex: 1;
+      height: 1px;
+      background: var(--border);
+    }
+    .section-hdr .tag {
+      font-family: var(--mono);
+      font-size: 10px;
+      color: var(--text-dim);
+      letter-spacing: .1em;
+    }
+
+    /* ══════════════════════════════════════════════
+       STATUS BAR
+    ══════════════════════════════════════════════ */
+    .statusbar {
+      height: 28px;
+      background: var(--panel);
+      border-top: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      padding: 0 20px;
+      gap: 20px;
+      flex-shrink: 0;
+    }
+    .statusbar span {
+      font-family: var(--mono);
+      font-size: 10px;
+      color: var(--text-dim);
+      letter-spacing: .06em;
+    }
+    .statusbar .ok  { color: var(--green-dim); }
+    .statusbar .err { color: var(--red); }
+
+    /* ══════════════════════════════════════════════
+       SCROLLBAR
+    ══════════════════════════════════════════════ */
+    ::-webkit-scrollbar { width: 5px; height: 5px; }
+    ::-webkit-scrollbar-track { background: var(--bg2); }
+    ::-webkit-scrollbar-thumb { background: var(--border-bright); border-radius: 4px; }
+  </style>
+  {% block head %}{% endblock %}
+</head>
+<body>
+
+<!-- ── Topbar ─────────────────────────────── -->
+<header class="topbar">
+  <a href="/" class="topbar-logo">
+    <div class="icon">
+      <svg viewBox="0 0 24 24"><path d="M17 10.5V7a1 1 0 0 0-1-1H4a1 1 0 0 0-1 1v10a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-3.5l4 4v-11l-4 4z"/></svg>
+    </div>
+    <span>CamRecorder&nbsp;/&nbsp;v2</span>
+  </a>
+
+  <nav class="topbar-nav">
+    <a href="/live"       class="nav-btn {% if request.path == '/live' %}active{% endif %}">▶ En Vivo</a>
+    <a href="/recordings" class="nav-btn {% if '/recordings' in request.path %}active{% endif %}">⏺ Grabaciones</a>
+  </nav>
+
+  <div class="topbar-right">
+    <div class="rec-dot" title="Grabación activa"></div>
+    <span class="clock" id="clock">--:--:--</span>
+  </div>
+</header>
+
+<!-- ── Contenido ─────────────────────────── -->
+{% block body %}{% endblock %}
+
+<!-- ── Statusbar ──────────────────────────── -->
+<footer class="statusbar">
+  <span id="sb-cams">cámaras: —</span>
+  <span>|</span>
+  <span id="sb-time">uptime: —</span>
+  <span>|</span>
+  <span style="margin-left:auto">IP Camera Recorder &nbsp;·&nbsp; <span style="color:var(--green-dim)">online</span></span>
+</footer>
+
+<script>
+  // Reloj
+  function tick() {
+    const now = new Date();
+    document.getElementById('clock').textContent =
+      now.toLocaleTimeString('es', {hour12:false});
+  }
+  tick(); setInterval(tick, 1000);
+
+  // Uptime
+  const _start = Date.now();
+  setInterval(() => {
+    const s = Math.floor((Date.now() - _start) / 1000);
+    const h = String(Math.floor(s/3600)).padStart(2,'0');
+    const m = String(Math.floor((s%3600)/60)).padStart(2,'0');
+    const ss= String(s%60).padStart(2,'0');
+    document.getElementById('sb-time').textContent = `uptime: ${h}:${m}:${ss}`;
+  }, 1000);
+
+  // Estado de cámaras
+  async function pollCamStatus() {
+    try {
+      const r = await fetch('/api/cameras');
+      const cams = await r.json();
+      const ok = cams.filter(c => c.status === 'ok').length;
+      const total = cams.length;
+      const el = document.getElementById('sb-cams');
+      el.textContent = `cámaras: ${ok}/${total} online`;
+      el.className = ok < total ? 'err' : 'ok';
+    } catch(e) {}
+  }
+  pollCamStatus(); setInterval(pollCamStatus, 8000);
+</script>
+
+{% block scripts %}{% endblock %}
+</body>
+</html>
