@@ -1,0 +1,55 @@
+# =============================================================
+# Configuración de Cámaras IP
+# =============================================================
+# Campos soportados por cámara:
+#
+#  name        : Nombre identificador (sin espacios)
+#  url         : URL RTSP o HTTP de la cámara
+#  enabled     : true/false para activar o desactivar la grabación
+#  split       : true/false para dividir el stream en dos cámaras lógicas
+#  split_names : nombres de salida para cada mitad
+#  split_axis  : vertical | horizontal
+#                vertical   = izquierda / derecha
+#                horizontal = arriba / abajo
+#  fps         : FPS deseados
+#  width       : Ancho de captura (0 = automático)
+#  height      : Alto de captura (0 = automático)
+# =============================================================
+
+cameras:
+  - name: "cam_entrada"
+    url: "rtsp://admin:9H)p5x84@192.168.1.64:554/Streaming/Channels/102"
+    enabled: true
+    split: false
+    fps: 15
+    width: 1920
+    height: 1080
+
+  - name: "cam_doble_parking"
+    url: "rtsp://peww:tn3tdw@192.168.1.13:554/live/ch00_1"
+    enabled: true
+    split: true
+    split_axis: vertical
+    split_names:
+      - "cam_parking_izquierda"
+      - "cam_parking_derecha"
+    fps: 15
+    width: 0
+    height: 0
+
+  - name: "cam_bodega"
+    url: "rtsp://admin:password@192.168.1.102:554/stream1"
+    enabled: false
+    split: false
+    fps: 10
+    width: 1280
+    height: 720
+
+recording:
+  segment_duration_minutes: 60
+  output_dir: "/recordings"
+  video_format: "mp4"
+  codec: "mp4v"
+  reconnect_delay_seconds: 10
+  max_reconnect_attempts: 0
+  log_level: "INFO"
