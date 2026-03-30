@@ -29,10 +29,10 @@ cameras:
     url: "rtsp://peww:tn3tdw@192.168.1.13:554/live/ch00_1"
     enabled: true
     split: true
-    split_axis: vertical
+    split_axis: horizontal
     split_names:
-      - "cam_parking_izquierda"
-      - "cam_parking_derecha"
+      - "cam_parking_1"
+      - "cam_parking_2"
     fps: 15
     width: 0
     height: 0
