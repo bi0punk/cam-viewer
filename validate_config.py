@@ -47,9 +47,23 @@ def main(path: str):
         if cam.get('split') and len(cam.get('split_names', [])) < 2:
             errors.append(f"{name}: split=true requiere al menos 2 split_names")
 
+        for field in ('fps', 'output_fps', 'preview_fps'):
+            if field in cam and float(cam.get(field, 0)) < 0:
+                errors.append(f"{name}: {field} no puede ser negativo")
+
+        for field in ('width', 'height', 'preview_width'):
+            if field in cam and int(cam.get(field, 0)) < 0:
+                errors.append(f"{name}: {field} no puede ser negativo")
+
+        quality = int(cam.get('preview_jpeg_quality', 70))
+        if quality < 30 or quality > 95:
+            errors.append(f"{name}: preview_jpeg_quality debe estar entre 30 y 95")
+
     recording = raw.get('recording', {})
     if int(recording.get('segment_duration_minutes', 60)) <= 0:
         errors.append("recording.segment_duration_minutes debe ser > 0")
+    if float(recording.get('status_write_interval_seconds', 2.0)) <= 0:
+        errors.append("recording.status_write_interval_seconds debe ser > 0")
 
     if errors:
         print("Configuración inválida:")

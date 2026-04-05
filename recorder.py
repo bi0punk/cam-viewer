@@ -1,20 +1,18 @@
 #!/usr/bin/env python3
 """
-Grabador de cámaras IP con segmentación alineada al reloj y escritura robusta.
+Grabador de cámaras IP endurecido para operación continua.
 
-Mejoras principales sobre la versión anterior:
-- Segmentación exacta por hora usando reloj de pared.
-- Escritura desacoplada de la captura para reducir lag y jitter.
-- Clips con duración consistente aunque la cámara entregue FPS variables.
-- Reintentos de conexión con backoff.
-- Normalización de frames a dimensiones pares para evitar fallos de VideoWriter.
-- Detección de stream congelado y bajo espacio en disco.
-- Sustitución de variables de entorno en YAML (${VAR}).
-- Logs operacionales con métricas reales de captura/escritura.
+Cambios clave:
+- Una sola conexión RTSP por cámara para grabación y preview.
+- Publicación de frames preview en disco compartido para que la web NO abra RTSP.
+- Detección más agresiva de stream congelado o lecturas fallidas.
+- Escritura desacoplada de captura y segmentación alineada al reloj.
+- Logs operacionales con métricas reales por segmento.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import os
@@ -32,7 +30,6 @@ from typing import List, Optional, Tuple
 import cv2
 import yaml
 
-# Recomendado para RTSP inestable. No sobreescribe si el usuario ya definió algo.
 os.environ.setdefault(
     "OPENCV_FFMPEG_CAPTURE_OPTIONS",
     "rtsp_transport;tcp|stimeout;5000000",
@@ -50,18 +47,24 @@ class CameraConfig:
     enabled: bool = True
     split: bool = False
     split_names: List[str] = field(default_factory=lambda: ["left", "right"])
-    split_axis: str = "vertical"  # vertical=izquierda/derecha, horizontal=arriba/abajo
+    split_axis: str = "vertical"
     fps: float = 15.0
     width: int = 0
     height: int = 0
     output_fps: float = 0.0
     max_live_frame_age_seconds: float = 10.0
+    preview_width: int = 960
+    preview_fps: float = 5.0
+    preview_jpeg_quality: int = 70
+    startup_frame_timeout_seconds: int = 20
+    stale_stream_timeout_seconds: int = 12
 
 
 @dataclass
 class RecordingConfig:
     segment_duration_minutes: int = 60
     output_dir: str = "/recordings"
+    live_cache_dir: str = "/live_cache"
     video_format: str = "mp4"
     codec: str = "mp4v"
     fallback_codecs: List[str] = field(default_factory=lambda: DEFAULT_FALLBACK_CODECS.copy())
@@ -72,6 +75,7 @@ class RecordingConfig:
     min_disk_free_gb: float = 1.0
     startup_frame_timeout_seconds: int = 20
     stale_stream_timeout_seconds: int = 12
+    status_write_interval_seconds: float = 2.0
 
 
 @dataclass
@@ -102,6 +106,7 @@ class CaptureBuffer:
         self._frame_shape = None
         self.frames_captured = 0
         self.read_failures = 0
+        self.last_success_ts = 0.0
 
     def update(self, frame):
         now = time.monotonic()
@@ -110,6 +115,7 @@ class CaptureBuffer:
             self._frame_ts = now
             self._frame_shape = frame.shape[:2]
             self.frames_captured += 1
+            self.last_success_ts = now
 
     def mark_failure(self):
         with self._lock:
@@ -118,6 +124,113 @@ class CaptureBuffer:
     def snapshot(self):
         with self._lock:
             return self._frame, self._frame_ts, self._frame_shape
+
+
+class LiveCachePublisher:
+    def __init__(self, cam: CameraConfig, rec: RecordingConfig, logger: logging.Logger):
+        self.cam = cam
+        self.rec = rec
+        self.logger = logger
+        self.base_dir = Path(rec.live_cache_dir) / cam.name
+        self.base_dir.mkdir(parents=True, exist_ok=True)
+        self._last_publish_mono = 0.0
+        self._last_status_mono = 0.0
+        self._lock = threading.Lock()
+        self._status = {
+            "camera": cam.name,
+            "status": "starting",
+            "updated_at": datetime.now().isoformat(),
+            "last_frame_at": None,
+            "read_failures": 0,
+            "frames_captured": 0,
+            "split": cam.split,
+            "message": "inicializando",
+        }
+        self.write_status("starting", message="inicializando")
+
+    def write_status(self, status: str, message: str = "", **extra):
+        with self._lock:
+            self._status.update(extra)
+            self._status["status"] = status
+            self._status["message"] = message
+            self._status["updated_at"] = datetime.now().isoformat()
+            data = json.dumps(self._status, ensure_ascii=False, indent=2).encode("utf-8")
+        self._atomic_write_bytes(self.base_dir / "status.json", data)
+
+    def maybe_publish(self, frame, capture_ts: float, metrics: dict):
+        target_fps = max(0.1, float(self.cam.preview_fps or 5.0))
+        now_mono = time.monotonic()
+        if (now_mono - self._last_publish_mono) < (1.0 / target_fps):
+            if (now_mono - self._last_status_mono) >= self.rec.status_write_interval_seconds:
+                self._last_status_mono = now_mono
+                self.write_status(
+                    "ok",
+                    message="preview vigente",
+                    last_frame_at=datetime.now().isoformat(),
+                    **metrics,
+                )
+            return
+
+        prepared = self._prepare_preview_frame(frame)
+        ok, full_enc = cv2.imencode(
+            ".jpg",
+            prepared,
+            [cv2.IMWRITE_JPEG_QUALITY, max(30, min(95, int(self.cam.preview_jpeg_quality)))],
+        )
+        if not ok:
+            self.write_status("error", message="falló la codificación de preview", **metrics)
+            return
+
+        self._atomic_write_bytes(self.base_dir / "full.jpg", full_enc.tobytes())
+
+        if self.cam.split:
+            for idx, half in enumerate(self._split_frame(prepared)):
+                ok_half, half_enc = cv2.imencode(
+                    ".jpg",
+                    half,
+                    [cv2.IMWRITE_JPEG_QUALITY, max(30, min(95, int(self.cam.preview_jpeg_quality)))],
+                )
+                if ok_half:
+                    self._atomic_write_bytes(self.base_dir / f"side_{idx}.jpg", half_enc.tobytes())
+
+        self._last_publish_mono = now_mono
+        self._last_status_mono = now_mono
+        self.write_status(
+            "ok",
+            message="preview vigente",
+            last_frame_at=datetime.now().isoformat(),
+            last_capture_monotonic=capture_ts,
+            **metrics,
+        )
+
+    def _prepare_preview_frame(self, frame):
+        frame = ensure_even_frame(frame)
+        h, w = frame.shape[:2]
+        preview_width = max(0, int(self.cam.preview_width or 0))
+        if preview_width > 0 and w > preview_width:
+            scale = preview_width / float(w)
+            new_h = max(2, int(h * scale))
+            if new_h % 2:
+                new_h -= 1
+            frame = cv2.resize(frame, (preview_width, max(2, new_h)))
+        return ensure_even_frame(frame)
+
+    def _split_frame(self, frame):
+        frame = ensure_even_frame(frame)
+        h, w = frame.shape[:2]
+        axis = (self.cam.split_axis or "vertical").lower()
+        if axis == "horizontal":
+            mid = (h // 2) - ((h // 2) % 2)
+            return [ensure_even_frame(frame[:mid, :]), ensure_even_frame(frame[mid:, :])]
+        mid = (w // 2) - ((w // 2) % 2)
+        return [ensure_even_frame(frame[:, :mid]), ensure_even_frame(frame[:, mid:])]
+
+    def _atomic_write_bytes(self, path: Path, data: bytes):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        with open(tmp, "wb") as fh:
+            fh.write(data)
+        os.replace(tmp, path)
 
 
 def substitute_env_vars(text: str) -> str:
@@ -141,6 +254,7 @@ def load_config(config_path: str) -> Tuple[List[CameraConfig], RecordingConfig]:
     rec_cfg = RecordingConfig(
         segment_duration_minutes=int(rec_raw.get("segment_duration_minutes", 60)),
         output_dir=rec_raw.get("output_dir", "/recordings"),
+        live_cache_dir=rec_raw.get("live_cache_dir", "/live_cache"),
         video_format=str(rec_raw.get("video_format", "mp4")).lower(),
         codec=str(rec_raw.get("codec", "mp4v")),
         fallback_codecs=list(dict.fromkeys([str(c) for c in fallback_codecs if c])),
@@ -151,6 +265,7 @@ def load_config(config_path: str) -> Tuple[List[CameraConfig], RecordingConfig]:
         min_disk_free_gb=float(rec_raw.get("min_disk_free_gb", 1.0)),
         startup_frame_timeout_seconds=int(rec_raw.get("startup_frame_timeout_seconds", 20)),
         stale_stream_timeout_seconds=int(rec_raw.get("stale_stream_timeout_seconds", 12)),
+        status_write_interval_seconds=float(rec_raw.get("status_write_interval_seconds", 2.0)),
     )
 
     cameras: List[CameraConfig] = []
@@ -177,6 +292,15 @@ def load_config(config_path: str) -> Tuple[List[CameraConfig], RecordingConfig]:
                 output_fps=float(cam.get("output_fps", 0.0)),
                 max_live_frame_age_seconds=float(
                     cam.get("max_live_frame_age_seconds", rec_cfg.stale_stream_timeout_seconds)
+                ),
+                preview_width=int(cam.get("preview_width", 960)),
+                preview_fps=float(cam.get("preview_fps", 5.0)),
+                preview_jpeg_quality=int(cam.get("preview_jpeg_quality", 70)),
+                startup_frame_timeout_seconds=int(
+                    cam.get("startup_frame_timeout_seconds", rec_cfg.startup_frame_timeout_seconds)
+                ),
+                stale_stream_timeout_seconds=int(
+                    cam.get("stale_stream_timeout_seconds", rec_cfg.stale_stream_timeout_seconds)
                 ),
             )
         )
@@ -261,10 +385,12 @@ class CameraRecorder:
         self.cam = cam
         self.rec = rec
         self.logger = setup_logger(cam.name, rec.log_level)
+        self.publisher = LiveCachePublisher(cam, rec, self.logger)
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._capture_thread: Optional[threading.Thread] = None
         self._capture_stop = threading.Event()
+        self._capture_dead = threading.Event()
         self._capture_buffer = CaptureBuffer()
         self._cap: Optional[cv2.VideoCapture] = None
 
@@ -276,6 +402,7 @@ class CameraRecorder:
         self.logger.info("Deteniendo grabación...")
         self._stop_event.set()
         self._stop_capture_thread()
+        self.publisher.write_status("stopped", message="detenido por señal")
         if self._thread:
             self._thread.join(timeout=20)
 
@@ -286,20 +413,22 @@ class CameraRecorder:
             max_att = self.rec.max_reconnect_attempts
             if max_att > 0 and attempt > max_att:
                 self.logger.error("Máximo de intentos (%s) alcanzado. Saliendo.", max_att)
+                self.publisher.write_status("error", message="máximo de reintentos alcanzado")
                 break
 
+            self.publisher.write_status("connecting", message="abriendo RTSP", reconnect_attempt=attempt)
             self.logger.info("Conectando (intento %s) -> %s", attempt, self._masked_url())
             self._cap = self._open_capture()
             if self._cap is None or not self._cap.isOpened():
-                self.logger.warning(
-                    "No se pudo abrir la cámara. Reintentando en %ss...",
-                    self._current_backoff(attempt),
-                )
-                self._wait(self._current_backoff(attempt))
+                delay = self._current_backoff(attempt)
+                self.logger.warning("No se pudo abrir la cámara. Reintentando en %ss...", delay)
+                self.publisher.write_status("error", message=f"no se pudo abrir RTSP; reintento en {delay}s")
+                self._wait(delay)
                 continue
 
             self._capture_buffer = CaptureBuffer()
             self._capture_stop.clear()
+            self._capture_dead.clear()
             self._capture_thread = threading.Thread(
                 target=self._capture_loop,
                 name=f"{self.cam.name}-capture",
@@ -309,12 +438,14 @@ class CameraRecorder:
 
             if not self._wait_for_first_frame():
                 self.logger.warning("No llegó un frame inicial en el tiempo esperado. Se forzará reconexión.")
+                self.publisher.write_status("error", message="timeout esperando primer frame")
                 self._stop_capture_thread()
                 self._wait(self._current_backoff(attempt))
                 continue
 
             attempt = 0
             self.logger.info("Conexión establecida. Iniciando grabación.")
+            self.publisher.write_status("ok", message="grabación activa")
             self._record_loop()
             self._stop_capture_thread()
 
@@ -322,6 +453,10 @@ class CameraRecorder:
                 self.logger.warning(
                     "Conexión perdida o stream congelado. Reintentando en %ss...",
                     self.rec.reconnect_delay_seconds,
+                )
+                self.publisher.write_status(
+                    "error",
+                    message=f"stream caído o congelado; reintento en {self.rec.reconnect_delay_seconds}s",
                 )
                 self._wait(self.rec.reconnect_delay_seconds)
 
@@ -346,13 +481,38 @@ class CameraRecorder:
 
     def _capture_loop(self):
         assert self._cap is not None
+        last_ok_mono = time.monotonic()
+        consecutive_failures = 0
+
         while not self._capture_stop.is_set() and not self._stop_event.is_set():
             ok, frame = self._cap.read()
+            now_mono = time.monotonic()
             if not ok or frame is None:
+                consecutive_failures += 1
                 self._capture_buffer.mark_failure()
+                if (now_mono - last_ok_mono) >= self.cam.stale_stream_timeout_seconds:
+                    self.logger.warning(
+                        "Sin frames válidos por %.2fs. Se derriba la captura para reconectar.",
+                        now_mono - last_ok_mono,
+                    )
+                    self._capture_dead.set()
+                    break
                 time.sleep(0.05)
                 continue
+
+            consecutive_failures = 0
+            last_ok_mono = now_mono
             self._capture_buffer.update(frame)
+            metrics = {
+                "frames_captured": self._capture_buffer.frames_captured,
+                "read_failures": self._capture_buffer.read_failures,
+            }
+            try:
+                self.publisher.maybe_publish(frame, now_mono, metrics)
+            except Exception as exc:
+                self.logger.warning("Falló publicación de preview: %s", exc)
+
+        self._capture_dead.set()
 
     def _stop_capture_thread(self):
         self._capture_stop.set()
@@ -367,7 +527,7 @@ class CameraRecorder:
             self._cap = None
 
     def _wait_for_first_frame(self) -> bool:
-        deadline = time.monotonic() + self.rec.startup_frame_timeout_seconds
+        deadline = time.monotonic() + self.cam.startup_frame_timeout_seconds
         while time.monotonic() < deadline and not self._stop_event.is_set():
             frame, frame_ts, _ = self._capture_buffer.snapshot()
             if frame is not None and frame_ts > 0:
@@ -388,6 +548,10 @@ class CameraRecorder:
         self.logger.info("FPS objetivo de escritura: %.3f", target_fps)
 
         while not self._stop_event.is_set():
+            if self._capture_dead.is_set():
+                self.logger.warning("El hilo de captura cayó. Se forzará reconexión.")
+                break
+
             frame, frame_ts, _ = self._capture_buffer.snapshot()
             if frame is None:
                 self.logger.warning("No se pudo leer el frame inicial del segmento.")
@@ -417,6 +581,8 @@ class CameraRecorder:
             segment_started_monotonic = time.monotonic()
             next_write_at = segment_started_monotonic
             segment_ok = True
+            start_frames_captured = self._capture_buffer.frames_captured
+            start_read_failures = self._capture_buffer.read_failures
             last_seen_capture_ts = frame_ts
 
             try:
@@ -425,7 +591,9 @@ class CameraRecorder:
                     now_wall = datetime.now()
                     if now_wall >= segment_end:
                         break
-
+                    if self._capture_dead.is_set():
+                        segment_ok = False
+                        break
                     if now_mono < next_write_at:
                         self._stop_event.wait(min(0.02, next_write_at - now_mono))
                         continue
@@ -461,7 +629,6 @@ class CameraRecorder:
 
                     lag = time.monotonic() - next_write_at
                     if lag > frame_interval * 3:
-                        # Re-sincroniza si la escritura quedó muy atrasada.
                         next_write_at = time.monotonic() + frame_interval
             finally:
                 for seg_writer in writers:
@@ -480,7 +647,9 @@ class CameraRecorder:
                         self.logger.exception("Error cerrando segmento %s: %s", seg_writer.final_path, exc)
 
                 elapsed = max(0.001, time.monotonic() - segment_started_monotonic)
-                capture_fps = self._capture_buffer.frames_captured / max(0.001, elapsed)
+                capture_frames_delta = self._capture_buffer.frames_captured - start_frames_captured
+                read_failures_delta = self._capture_buffer.read_failures - start_read_failures
+                capture_fps = capture_frames_delta / elapsed
                 write_fps_real = frames_written / elapsed
                 self.logger.info(
                     "Resumen segmento: elapsed=%.2fs, capture_fps=%.2f, write_fps=%.2f, repeated_writes=%s, read_failures=%s",
@@ -488,12 +657,20 @@ class CameraRecorder:
                     capture_fps,
                     write_fps_real,
                     writes_with_repeated_frame,
-                    self._capture_buffer.read_failures,
+                    read_failures_delta,
+                )
+                self.publisher.write_status(
+                    "ok" if segment_ok else "error",
+                    message="grabación activa" if segment_ok else "segmento interrumpido por stale stream",
+                    capture_fps=round(capture_fps, 2),
+                    write_fps=round(write_fps_real, 2),
+                    repeated_writes=writes_with_repeated_frame,
+                    read_failures=self._capture_buffer.read_failures,
+                    frames_captured=self._capture_buffer.frames_captured,
                 )
 
             if self._stop_event.is_set():
                 break
-
             if not segment_ok:
                 break
 
@@ -619,50 +796,40 @@ class RecorderOrchestrator:
         for cam in cameras:
             if cam.enabled:
                 self.recorders.append(CameraRecorder(cam, self.rec))
-            else:
-                self.logger.info("Cámara desactivada, omitiendo: %s", cam.name)
 
-    def start_all(self):
-        self.logger.info("Iniciando %s grabador(es)...", len(self.recorders))
+        self.logger.info("Cámaras habilitadas: %s", [r.cam.name for r in self.recorders])
+
+    def start(self):
         for recorder in self.recorders:
             recorder.start()
-        self.logger.info("Todos los grabadores iniciados.")
 
-    def stop_all(self):
-        self.logger.info("Señal de parada recibida. Cerrando grabadores...")
+    def stop(self):
+        self.logger.info("Apagando grabador...")
         for recorder in self.recorders:
             recorder.stop()
-        self.logger.info("Todos los grabadores detenidos.")
 
-    def wait(self):
-        try:
-            while True:
-                time.sleep(5)
-                alive = [r.cam.name for r in self.recorders if r._thread and r._thread.is_alive()]
-                self.logger.debug("Grabadores activos: %s", alive)
-        except KeyboardInterrupt:
-            pass
+
+_STOP = False
+
+
+def _handle_signal(signum, frame):
+    global _STOP
+    _STOP = True
 
 
 def main():
     config_path = os.environ.get("CONFIG_PATH", "/config/cameras.yaml")
-
-    if not Path(config_path).exists():
-        print(f"ERROR: Archivo de configuración no encontrado: {config_path}", file=sys.stderr)
-        sys.exit(1)
-
     orchestrator = RecorderOrchestrator(config_path)
 
-    def _signal_handler(sig, frame):
-        orchestrator.stop_all()
-        sys.exit(0)
+    signal.signal(signal.SIGTERM, _handle_signal)
+    signal.signal(signal.SIGINT, _handle_signal)
 
-    signal.signal(signal.SIGINT, _signal_handler)
-    signal.signal(signal.SIGTERM, _signal_handler)
-
-    orchestrator.start_all()
-    orchestrator.wait()
-    orchestrator.stop_all()
+    orchestrator.start()
+    try:
+        while not _STOP:
+            time.sleep(1)
+    finally:
+        orchestrator.stop()
 
 
 if __name__ == "__main__":

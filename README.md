@@ -1,58 +1,70 @@
-# IP Camera Recorder — versión endurecida
+# IP Camera Recorder — versión con preview compartido
 
-Proyecto para grabar cámaras IP y visualizar streams en vivo desde una interfaz web.
+Proyecto para grabar cámaras IP y visualizar streams en vivo desde una interfaz web sin abrir RTSP desde el frontend.
 
-## Qué mejoré
+## Qué cambia en esta versión
 
-### Grabación
-- Segmentación alineada al reloj: si el proceso inicia a las `10:23`, el primer clip termina a las `11:00`; luego crea clips `11:00-12:00`, `12:00-13:00`, etc.
-- Escritura desacoplada de la captura para reducir jitter y lag.
-- FPS de salida estables por clip: evita que un stream irregular termine generando videos con duración de reproducción incorrecta.
-- Detección de stream congelado y reconexión automática.
-- Frames normalizados a dimensiones pares para evitar fallos intermitentes de `VideoWriter`.
-- Fallback de codecs para mejorar compatibilidad.
-- Aviso de poco espacio en disco.
-- Soporte de variables de entorno en YAML para no dejar credenciales duras en el repositorio.
+### 1) Se elimina la doble conexión RTSP
+Antes, el `recorder` y la `web` abrían la cámara por separado. Ahora:
 
-### Vista web
-- Carga lazy: no abre RTSP hasta que un cliente realmente entra a `/live`.
-- Cierre automático de streams inactivos.
-- Cachea JPEG completo y mitades split en memoria para evitar recortar y recomprimir por cada cliente.
-- Cache TTL para listados de grabaciones.
-- Endpoint `/health` para healthcheck real.
+- `recorder.py` abre **una sola** conexión RTSP por cámara.
+- El grabador publica previews JPEG en `/live_cache/<cam>/`.
+- `web/app.py` sirve esos JPEG como MJPEG al navegador.
 
-### Operación
-- Dockerfile y Compose más limpios.
-- `init: true` y `stop_grace_period` para cierres más limpios.
-- Archivo `.env.example`.
-- Script `validate_config.py`.
+Resultado:
 
----
+- menos carga sobre la cámara
+- menos CPU por doble decodificación
+- menos riesgo de freeze al abrir `/live`
 
-## Estructura de grabaciones
+### 2) Preview más liviano y controlado
+Cada cámara puede definir:
 
-```text
-recordings/
-└── cam_parking_izquierda/
-    └── 2026-03/
-        └── 30/
-            ├── cam_parking_izquierda_20260330_102300.mp4
-            ├── cam_parking_izquierda_20260330_110000.mp4
-            └── cam_parking_izquierda_20260330_120000.mp4
-```
+- `preview_width`
+- `preview_fps`
+- `preview_jpeg_quality`
 
-## Comportamiento de segmentación
+Eso permite mantener la web fluida sin obligar a codificar JPEG a resolución completa.
+
+### 3) Grabación más estable
+Se mantiene una sola captura RTSP y la grabación continúa desacoplada de la captura.
+Además:
+
+- reconexión agresiva si no llegan frames válidos
+- detección de stream congelado
+- publicación de `status.json` por cámara en `/live_cache`
+- métricas por segmento: `capture_fps`, `write_fps`, `repeated_writes`, `read_failures`
+
+## Nueva arquitectura
 
 ```text
-Inicio real:         10:23:14
-Primer clip:         10:23:14 -> 11:00:00
-Segundo clip:        11:00:00 -> 12:00:00
-Tercer clip:         12:00:00 -> 13:00:00
+RTSP cámara
+   |
+   v
+recorder.py
+   |-- captura única OpenCV/FFmpeg backend
+   |-- grabación segmentada a /recordings
+   '-- preview JPEG a /live_cache
+
+web/app.py
+   '-- lee /live_cache y entrega /stream/<cam> al navegador
 ```
 
-Si el proceso parte exactamente a una hora cerrada, por ejemplo `14:00:00`, el primer clip será `14:00:00 -> 15:00:00`.
+## Estructura del preview compartido
 
----
+```text
+live_cache/
+└── cam_entrada/
+    ├── full.jpg
+    └── status.json
+
+live_cache/
+└── cam_doble_parking/
+    ├── full.jpg
+    ├── side_0.jpg
+    ├── side_1.jpg
+    └── status.json
+```
 
 ## Configuración YAML
 
@@ -60,22 +72,38 @@ Ejemplo:
 
 ```yaml
 cameras:
+  - name: "cam_entrada"
+    url: "${CAM_ENTRADA_URL}"
+    enabled: true
+    split: false
+    fps: 15
+    output_fps: 15
+    width: 1920
+    height: 1080
+    preview_width: 960
+    preview_fps: 5
+    preview_jpeg_quality: 70
+
   - name: "cam_doble_parking"
     url: "${CAM_DOBLE_PARKING_URL}"
     enabled: true
     split: true
-    split_axis: vertical
+    split_axis: horizontal
     split_names:
       - "cam_parking_izquierda"
       - "cam_parking_derecha"
     fps: 15
-    output_fps: 15
-    width: 0
-    height: 0
+    output_fps: 12
+    width: 1280
+    height: 720
+    preview_width: 960
+    preview_fps: 4
+    preview_jpeg_quality: 65
 
 recording:
   segment_duration_minutes: 60
   output_dir: "/recordings"
+  live_cache_dir: "/live_cache"
   video_format: "mp4"
   codec: "mp4v"
   fallback_codecs: ["mp4v", "XVID", "MJPG"]
@@ -84,24 +112,14 @@ recording:
   startup_frame_timeout_seconds: 20
   stale_stream_timeout_seconds: 12
   min_disk_free_gb: 1.0
+  status_write_interval_seconds: 2.0
   log_level: "INFO"
 ```
 
----
-
 ## Levantar con Docker Compose
 
-1. Copia variables de ejemplo:
-
 ```bash
-cp .env.example .env
-```
-
-2. Ajusta URLs RTSP reales en `.env`.
-
-3. Levanta servicios:
-
-```bash
+cp .env.example .env  # o cp env.example .env si tu extractor oculta dotfiles
 docker compose up -d --build
 ```
 
@@ -124,28 +142,31 @@ Bajar servicios:
 docker compose down
 ```
 
----
-
-## Vista web
+## URLs
 
 - En vivo: `http://IP_DEL_SERVIDOR:8080/live`
 - Grabaciones: `http://IP_DEL_SERVIDOR:8080/recordings`
 - Health: `http://IP_DEL_SERVIDOR:8080/health`
+- Estado cámara: `http://IP_DEL_SERVIDOR:8080/api/cameras`
 
----
+## Recomendaciones operacionales
 
-## Prueba rápida de una cámara
+### Para cámaras normales
+- usa `preview_fps` entre `4` y `6`
+- usa `preview_width` entre `854` y `960`
+- usa `preview_jpeg_quality` entre `60` y `72`
 
-```bash
-python test_camera.py "rtsp://usuario:clave@IP:554/stream1"
-python test_camera.py "rtsp://usuario:clave@IP:554/stream1" --split --split-axis vertical
-```
+### Para cámaras split
+- evita resoluciones demasiado altas si el host es CPU-only
+- baja `output_fps` a `10-12` si ves `repeated_writes` altos
+- define `width` y `height`; no dejes `0/0` si el stream negocia mal
 
----
+### Cómo revisar si mejoró
+Observa en logs del `recorder`:
 
-## Notas operacionales
+- `capture_fps`
+- `write_fps`
+- `repeated_writes`
+- `read_failures`
 
-- El proyecto sigue grabando solo video.
-- Para producción con muchas cámaras, conviene monitorear CPU, I/O de disco, uso de RAM y ancho de banda RTSP.
-- Si una cámara entrega FPS muy inestables, esta versión prioriza duración correcta del clip y continuidad visual, aunque pueda repetir el último frame cuando la cámara se atrasa.
-- Si quieres grabación más eficiente aún, el siguiente salto natural es migrar ciertos casos a FFmpeg con `-c copy` para cámaras sin split.
+Si al abrir `/live` ya no sube fuerte el uso de CPU, la eliminación de la doble captura quedó bien aplicada.

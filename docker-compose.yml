@@ -15,6 +15,7 @@ services:
     volumes:
       - ./config:/config:ro
       - ./recordings:/recordings
+      - ./live_cache:/live_cache
       - ./logs:/logs
     stop_grace_period: 30s
     healthcheck:
@@ -40,7 +41,7 @@ services:
       gunicorn
       --bind 0.0.0.0:8080
       --workers 1
-      --threads 16
+      --threads 8
       --timeout 120
       --worker-class gthread
       --access-logfile -
@@ -49,16 +50,16 @@ services:
     environment:
       CONFIG_PATH: /config/cameras.yaml
       RECORDINGS_DIR: /recordings
+      LIVE_CACHE_DIR: /live_cache
       WEB_PORT: 8080
       LOG_LEVEL: INFO
+      STATUS_CACHE_TTL: 1.0
       TZ: America/Santiago
-      LIVE_MAX_WIDTH: 1280
-      LIVE_JPEG_QUALITY: 80
-      LIVE_IDLE_SECONDS: 30
       RECORDINGS_CACHE_TTL: 10
     volumes:
       - ./config:/config:ro
       - ./recordings:/recordings:ro
+      - ./live_cache:/live_cache:ro
     ports:
       - "8080:8080"
     depends_on:

@@ -1,23 +1,22 @@
 # =============================================================
-# Configuración de Cámaras IP
+# Configuración de Cámaras IP — versión con preview compartido
 # =============================================================
-# Soporta variables de entorno en formato ${VAR} o ${VAR:-default}
-# Ejemplo:
-#   url: "${CAM_ENTRADA_URL}"
+# Esta versión elimina la doble apertura RTSP: el grabador publica
+# previews JPEG en /live_cache y la web consume esos archivos.
 #
 # Campos soportados por cámara:
-#  name        : Nombre identificador (sin espacios)
-#  url         : URL RTSP o HTTP de la cámara
-#  enabled     : true/false para activar o desactivar la grabación
-#  split       : true/false para dividir el stream en dos cámaras lógicas
-#  split_names : nombres de salida para cada mitad
-#  split_axis  : vertical | horizontal
-#                vertical   = izquierda / derecha
-#                horizontal = arriba / abajo
-#  fps         : FPS objetivo por defecto
-#  output_fps  : FPS de escritura del archivo final (0 = usar fps)
-#  width       : Ancho de captura solicitado (0 = automático)
-#  height      : Alto de captura solicitado (0 = automático)
+#  name                 : identificador lógico
+#  url                  : URL RTSP/HTTP principal
+#  enabled              : true/false
+#  split                : divide el frame en dos salidas lógicas
+#  split_names          : nombres de las dos salidas cuando split=true
+#  split_axis           : vertical | horizontal
+#  fps                  : FPS objetivo de captura
+#  output_fps           : FPS objetivo de grabación (0 = usar fps)
+#  width/height         : hint de resolución solicitado al backend
+#  preview_width        : ancho máximo del preview publicado
+#  preview_fps          : FPS del preview publicado a /live_cache
+#  preview_jpeg_quality : calidad JPEG del preview (30-95)
 # =============================================================
 
 cameras:
@@ -29,6 +28,9 @@ cameras:
     output_fps: 15
     width: 1920
     height: 1080
+    preview_width: 960
+    preview_fps: 5
+    preview_jpeg_quality: 70
 
   - name: "cam_doble_parking"
     url: "${CAM_DOBLE_PARKING_URL:-rtsp://admin:password@192.168.1.13:554/live/ch00_1}"
@@ -39,9 +41,12 @@ cameras:
       - "cam_parking_izquierda"
       - "cam_parking_derecha"
     fps: 15
-    output_fps: 15
-    width: 0
-    height: 0
+    output_fps: 12
+    width: 1280
+    height: 720
+    preview_width: 960
+    preview_fps: 4
+    preview_jpeg_quality: 65
 
   - name: "cam_bodega"
     url: "${CAM_BODEGA_URL:-rtsp://admin:password@192.168.1.102:554/stream1}"
@@ -51,10 +56,14 @@ cameras:
     output_fps: 10
     width: 1280
     height: 720
+    preview_width: 960
+    preview_fps: 4
+    preview_jpeg_quality: 65
 
 recording:
   segment_duration_minutes: 60
   output_dir: "/recordings"
+  live_cache_dir: "/live_cache"
   video_format: "mp4"
   codec: "mp4v"
   fallback_codecs:
@@ -67,4 +76,5 @@ recording:
   startup_frame_timeout_seconds: 20
   stale_stream_timeout_seconds: 12
   min_disk_free_gb: 1.0
+  status_write_interval_seconds: 2.0
   log_level: "INFO"

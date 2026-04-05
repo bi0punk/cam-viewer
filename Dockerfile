@@ -26,7 +26,7 @@ COPY requirements.txt .
 RUN pip install -r requirements.txt
 
 COPY recorder.py .
+COPY validate_config.py .
 COPY test_camera.py .
 COPY web/ ./web/
-
-RUN mkdir -p /recordings /config /logs
+RUN mkdir -p /recordings /config /logs /live_cache

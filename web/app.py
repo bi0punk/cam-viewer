@@ -2,16 +2,13 @@
 """
 Interfaz web para cámaras en vivo y grabaciones.
 
-Mejoras principales:
-- lazy loading: no abre RTSP hasta que un cliente lo solicita
-- cierre automático de streams inactivos
-- cachea JPEG completo y mitades split para evitar decodificar/re-encodificar por cliente
-- cache TTL para el listado de grabaciones
-- endpoint /health útil para healthcheck
+Esta versión NO abre RTSP desde la web. Consume previews JPEG publicados por
+el grabador en un directorio compartido, eliminando la doble conexión a cámara.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import mimetypes
 import os
@@ -37,18 +34,12 @@ from flask import (
     url_for,
 )
 
-os.environ.setdefault(
-    "OPENCV_FFMPEG_CAPTURE_OPTIONS",
-    "rtsp_transport;tcp|stimeout;5000000",
-)
-
 CONFIG_PATH = os.environ.get("CONFIG_PATH", "/config/cameras.yaml")
 RECORDINGS_DIR = os.environ.get("RECORDINGS_DIR", "/recordings")
+LIVE_CACHE_DIR = os.environ.get("LIVE_CACHE_DIR", "/live_cache")
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
-LIVE_JPEG_QUALITY = int(os.environ.get("LIVE_JPEG_QUALITY", "80"))
-LIVE_MAX_WIDTH = int(os.environ.get("LIVE_MAX_WIDTH", "1280"))
-LIVE_IDLE_SECONDS = int(os.environ.get("LIVE_IDLE_SECONDS", "30"))
 RECORDINGS_CACHE_TTL = int(os.environ.get("RECORDINGS_CACHE_TTL", "10"))
+STATUS_CACHE_TTL = float(os.environ.get("STATUS_CACHE_TTL", "1.0"))
 
 ENV_VAR_PATTERN = re.compile(r"\$\{([^}:]+)(?::-(.*?))?\}")
 ALLOWED_VIDEO_EXTS = {".mp4", ".mkv", ".avi"}
@@ -83,18 +74,16 @@ def load_cameras():
     for cam in raw.get("cameras", []):
         if not cam.get("enabled", True):
             continue
-
         cameras.append(
             {
                 "name": cam["name"],
-                "url": cam["url"],
                 "split": bool(cam.get("split", False)),
                 "split_names": cam.get(
                     "split_names",
                     [f"{cam['name']}_izquierda", f"{cam['name']}_derecha"],
                 ),
                 "split_axis": str(cam.get("split_axis", "vertical")).lower(),
-                "fps": float(cam.get("fps", 15)),
+                "fps": float(cam.get("preview_fps", cam.get("fps", 5))),
             }
         )
     return cameras
@@ -136,154 +125,85 @@ def build_live_display_list():
     return display_cams
 
 
-class StreamManager:
+class SnapshotCache:
+    def __init__(self, live_cache_dir: str, status_cache_ttl: float = 1.0):
+        self.live_cache_dir = Path(live_cache_dir)
+        self.status_cache_ttl = status_cache_ttl
+        self._lock = threading.Lock()
+        self._file_cache: Dict[str, dict] = {}
+        self._status_cache: Dict[str, dict] = {}
+
+    def get_frame(self, name: str, side: Optional[int] = None) -> Optional[bytes]:
+        filename = f"side_{side}.jpg" if side is not None else "full.jpg"
+        path = self.live_cache_dir / name / filename
+        return self._read_bytes(path)
+
+    def get_status(self, name: str) -> dict:
+        path = self.live_cache_dir / name / "status.json"
+        cache_key = str(path)
+        now = time.time()
+        with self._lock:
+            cached = self._status_cache.get(cache_key)
+            if cached and now < cached["expires_at"]:
+                return dict(cached["data"])
+
+        if not path.exists():
+            return {"status": "connecting", "message": "esperando preview", "last_frame_at": None}
+
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return {"status": "error", "message": "status.json inválido", "last_frame_at": None}
+
+        with self._lock:
+            self._status_cache[cache_key] = {
+                "expires_at": now + self.status_cache_ttl,
+                "data": data,
+            }
+        return dict(data)
+
+    def _read_bytes(self, path: Path) -> Optional[bytes]:
+        cache_key = str(path)
+        try:
+            stat = path.stat()
+        except FileNotFoundError:
+            return None
+
+        with self._lock:
+            cached = self._file_cache.get(cache_key)
+            if cached and cached["mtime_ns"] == stat.st_mtime_ns and cached["size"] == stat.st_size:
+                return cached["data"]
+
+        data = path.read_bytes()
+        with self._lock:
+            self._file_cache[cache_key] = {
+                "mtime_ns": stat.st_mtime_ns,
+                "size": stat.st_size,
+                "data": data,
+            }
+        return data
+
+
+class ClientRegistry:
     def __init__(self):
         self._lock = threading.Lock()
-        self._frames: Dict[str, Optional[bytes]] = {}
-        self._split_frames: Dict[str, Dict[int, bytes]] = {}
-        self._threads: Dict[str, threading.Thread] = {}
-        self._stop_flags: Dict[str, threading.Event] = {}
         self._clients: Dict[str, int] = {}
-        self._status: Dict[str, str] = {}
-        self._last_frame_ts: Dict[str, float] = {}
-        self._last_access_ts: Dict[str, float] = {}
-        self._reaper_thread = threading.Thread(target=self._reaper_loop, daemon=True)
-        self._reaper_thread.start()
 
-    def acquire(self, name: str, url: str, split_axis: str = "vertical"):
+    def acquire(self, name: str):
         with self._lock:
             self._clients[name] = self._clients.get(name, 0) + 1
-            self._last_access_ts[name] = time.time()
-            if name not in self._threads or not self._threads[name].is_alive():
-                stop_flag = threading.Event()
-                self._stop_flags[name] = stop_flag
-                self._frames[name] = None
-                self._split_frames[name] = {}
-                self._status[name] = "connecting"
-                thread = threading.Thread(
-                    target=self._capture_loop,
-                    args=(name, url, split_axis, stop_flag),
-                    daemon=True,
-                    name=f"web-{name}",
-                )
-                self._threads[name] = thread
-                thread.start()
 
     def release(self, name: str):
         with self._lock:
             self._clients[name] = max(0, self._clients.get(name, 0) - 1)
-            self._last_access_ts[name] = time.time()
 
-    def touch(self, name: str):
+    def get(self, name: str) -> int:
         with self._lock:
-            self._last_access_ts[name] = time.time()
-
-    def get_frame(self, name: str, side: Optional[int] = None):
-        with self._lock:
-            self._last_access_ts[name] = time.time()
-            if side is None:
-                return self._frames.get(name)
-            return self._split_frames.get(name, {}).get(side) or self._frames.get(name)
-
-    def status(self, name: str):
-        with self._lock:
-            age = time.time() - self._last_frame_ts.get(name, 0)
-            return {
-                "status": self._status.get(name, "connecting"),
-                "clients": self._clients.get(name, 0),
-                "last_frame_age_seconds": round(age, 2) if self._last_frame_ts.get(name) else None,
-            }
-
-    def _capture_loop(self, name: str, url: str, split_axis: str, stop_flag: threading.Event):
-        logger.info("[%s] Abriendo stream para vista en vivo...", name)
-        while not stop_flag.is_set():
-            cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-
-            if not cap.isOpened():
-                with self._lock:
-                    self._status[name] = "error"
-                logger.warning("[%s] No se pudo conectar. Reintentando en 5s...", name)
-                stop_flag.wait(5)
-                continue
-
-            with self._lock:
-                self._status[name] = "ok"
-            logger.info("[%s] Stream de vista en vivo conectado.", name)
-
-            while not stop_flag.is_set():
-                ok, frame = cap.read()
-                if not ok or frame is None:
-                    logger.warning("[%s] Frame perdido, reconectando...", name)
-                    with self._lock:
-                        self._status[name] = "error"
-                    break
-
-                frame = self._prepare_frame(frame)
-                full_jpeg, split_map = self._encode_frame_variants(frame, split_axis)
-                with self._lock:
-                    self._frames[name] = full_jpeg
-                    self._split_frames[name] = split_map
-                    self._last_frame_ts[name] = time.time()
-                    self._status[name] = "ok"
-
-            cap.release()
-            if not stop_flag.is_set():
-                stop_flag.wait(2)
-
-        with self._lock:
-            self._status[name] = "stopped"
-        logger.info("[%s] Stream de vista en vivo detenido.", name)
-
-    def _prepare_frame(self, frame):
-        h, w = frame.shape[:2]
-        if LIVE_MAX_WIDTH > 0 and w > LIVE_MAX_WIDTH:
-            scale = LIVE_MAX_WIDTH / w
-            frame = cv2.resize(frame, (LIVE_MAX_WIDTH, int(h * scale)))
-        return frame
-
-    def _encode_frame_variants(self, frame, split_axis: str):
-        ok, full_enc = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, LIVE_JPEG_QUALITY])
-        full_jpeg = full_enc.tobytes() if ok else b""
-
-        h, w = frame.shape[:2]
-        split_axis = (split_axis or "vertical").lower()
-        if split_axis == "horizontal":
-            mid = h // 2
-            first = frame[:mid, :]
-            second = frame[mid:, :]
-        else:
-            mid = w // 2
-            first = frame[:, :mid]
-            second = frame[:, mid:]
-
-        split_map = {}
-        for idx, half in enumerate((first, second)):
-            ok_half, half_enc = cv2.imencode(".jpg", half, [cv2.IMWRITE_JPEG_QUALITY, LIVE_JPEG_QUALITY])
-            split_map[idx] = half_enc.tobytes() if ok_half else full_jpeg
-        return full_jpeg, split_map
-
-    def _reaper_loop(self):
-        while True:
-            now = time.time()
-            to_stop = []
-            with self._lock:
-                for name, thread in list(self._threads.items()):
-                    if not thread.is_alive():
-                        continue
-                    clients = self._clients.get(name, 0)
-                    last_access = self._last_access_ts.get(name, 0)
-                    if clients <= 0 and (now - last_access) > LIVE_IDLE_SECONDS:
-                        to_stop.append(name)
-            for name in to_stop:
-                logger.info("[%s] Cerrando stream inactivo de la web.", name)
-                stop_flag = self._stop_flags.get(name)
-                if stop_flag:
-                    stop_flag.set()
-            time.sleep(5)
+            return self._clients.get(name, 0)
 
 
-stream_mgr = StreamManager()
+snapshot_cache = SnapshotCache(LIVE_CACHE_DIR, STATUS_CACHE_TTL)
+client_registry = ClientRegistry()
 
 
 class TTLCache:
@@ -306,12 +226,6 @@ class TTLCache:
     def set(self, key, value):
         with self._lock:
             self._data[key] = (time.time() + self.ttl_seconds, value)
-
-    def invalidate_prefix(self, prefix: str = ""):
-        with self._lock:
-            for key in list(self._data.keys()):
-                if str(key).startswith(prefix):
-                    self._data.pop(key, None)
 
 
 recordings_cache = TTLCache(RECORDINGS_CACHE_TTL)
@@ -349,7 +263,6 @@ def get_camera_recordings(cam_name: str) -> list:
     for f in sorted(folder.rglob("*"), key=lambda p: p.stat().st_mtime, reverse=True):
         if not f.is_file() or f.suffix.lower() not in ALLOWED_VIDEO_EXTS:
             continue
-
         stat = f.stat()
         rel_path = f.relative_to(folder).as_posix()
         files.append(
@@ -409,6 +322,7 @@ def health():
         {
             "ok": True,
             "recordings_dir": RECORDINGS_DIR,
+            "live_cache_dir": LIVE_CACHE_DIR,
             "camera_count": len(CAMERAS),
             "time": datetime.now().isoformat(),
         }
@@ -427,31 +341,29 @@ def stream(name):
         abort(404)
 
     split_side = request.args.get("side", type=int, default=None)
-    split_axis = request.args.get("axis", default=cam_cfg.get("split_axis", "vertical"))
-    target_fps = max(1, int(cam_cfg.get("fps", 15)))
-    stream_mgr.acquire(name, cam_cfg["url"], split_axis)
+    target_fps = max(1, int(cam_cfg.get("fps", 5)))
+    client_registry.acquire(name)
 
     def generate():
         placeholder = _placeholder_jpeg()
         try:
             while True:
-                frame_bytes = stream_mgr.get_frame(name, split_side)
+                frame_bytes = snapshot_cache.get_frame(name, split_side)
                 if frame_bytes is None:
                     frame_bytes = placeholder
-
                 yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + frame_bytes + b"\r\n"
                 time.sleep(1 / target_fps)
         except GeneratorExit:
             logger.info("[%s] Cliente de stream desconectado.", name)
         finally:
-            stream_mgr.release(name)
+            client_registry.release(name)
 
     return Response(generate(), mimetype="multipart/x-mixed-replace; boundary=frame")
 
 
 def _placeholder_jpeg() -> bytes:
     img = np.zeros((360, 640, 3), dtype=np.uint8)
-    cv2.putText(img, "Conectando...", (190, 180), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 200, 0), 2)
+    cv2.putText(img, "Esperando preview...", (130, 180), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 200, 0), 2)
     _, enc = cv2.imencode(".jpg", img)
     return enc.tobytes()
 
@@ -494,19 +406,32 @@ def download_file(cam_name, relative_path):
 def api_cameras():
     result = []
     for cam in CAMERAS:
-        status = stream_mgr.status(cam["name"])
+        status = snapshot_cache.get_status(cam["name"])
         result.append(
             {
                 "name": cam["name"],
-                "status": status["status"],
-                "clients": status["clients"],
-                "last_frame_age_seconds": status["last_frame_age_seconds"],
+                "status": status.get("status", "connecting"),
+                "clients": client_registry.get(cam["name"]),
+                "last_frame_age_seconds": _last_frame_age(status.get("last_frame_at")),
                 "split": cam["split"],
                 "split_names": cam["split_names"] if cam["split"] else [],
                 "split_axis": cam.get("split_axis", "vertical"),
+                "message": status.get("message", ""),
+                "capture_fps": status.get("capture_fps"),
+                "write_fps": status.get("write_fps"),
             }
         )
     return jsonify(result)
+
+
+def _last_frame_age(last_frame_at: Optional[str]):
+    if not last_frame_at:
+        return None
+    try:
+        dt = datetime.fromisoformat(last_frame_at)
+        return round((datetime.now() - dt).total_seconds(), 2)
+    except Exception:
+        return None
 
 
 @app.route("/api/recordings/<cam_name>")
