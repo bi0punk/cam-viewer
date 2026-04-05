@@ -4,6 +4,7 @@ Prueba simple de cámara y snapshots.
 """
 
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -25,12 +26,14 @@ def test_camera(url: str, split: bool = False, split_axis: str = "vertical", sav
     print(f"  Probando conexión a: {url}")
     print(f"{'='*60}")
 
+    started = time.time()
     cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     if not cap.isOpened():
         print("ERROR: No se pudo conectar a la cámara.")
         sys.exit(1)
 
-    print("Conexión establecida.")
+    print(f"Conexión establecida en {time.time() - started:.2f}s.")
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps = cap.get(cv2.CAP_PROP_FPS)

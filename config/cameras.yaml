@@ -1,8 +1,11 @@
 # =============================================================
 # Configuración de Cámaras IP
 # =============================================================
-# Campos soportados por cámara:
+# Soporta variables de entorno en formato ${VAR} o ${VAR:-default}
+# Ejemplo:
+#   url: "${CAM_ENTRADA_URL}"
 #
+# Campos soportados por cámara:
 #  name        : Nombre identificador (sin espacios)
 #  url         : URL RTSP o HTTP de la cámara
 #  enabled     : true/false para activar o desactivar la grabación
@@ -11,37 +14,41 @@
 #  split_axis  : vertical | horizontal
 #                vertical   = izquierda / derecha
 #                horizontal = arriba / abajo
-#  fps         : FPS deseados
-#  width       : Ancho de captura (0 = automático)
-#  height      : Alto de captura (0 = automático)
+#  fps         : FPS objetivo por defecto
+#  output_fps  : FPS de escritura del archivo final (0 = usar fps)
+#  width       : Ancho de captura solicitado (0 = automático)
+#  height      : Alto de captura solicitado (0 = automático)
 # =============================================================
 
 cameras:
   - name: "cam_entrada"
-    url: "rtsp://admin:9H)p5x84@192.168.1.64:554/Streaming/Channels/102"
+    url: "${CAM_ENTRADA_URL:-rtsp://admin:password@192.168.1.64:554/Streaming/Channels/102}"
     enabled: true
     split: false
     fps: 15
+    output_fps: 15
     width: 1920
     height: 1080
 
   - name: "cam_doble_parking"
-    url: "rtsp://peww:tn3tdw@192.168.1.13:554/live/ch00_1"
+    url: "${CAM_DOBLE_PARKING_URL:-rtsp://admin:password@192.168.1.13:554/live/ch00_1}"
     enabled: true
     split: true
     split_axis: horizontal
     split_names:
-      - "cam_parking_1"
-      - "cam_parking_2"
+      - "cam_parking_izquierda"
+      - "cam_parking_derecha"
     fps: 15
+    output_fps: 15
     width: 0
     height: 0
 
   - name: "cam_bodega"
-    url: "rtsp://admin:password@192.168.1.102:554/stream1"
+    url: "${CAM_BODEGA_URL:-rtsp://admin:password@192.168.1.102:554/stream1}"
     enabled: false
     split: false
     fps: 10
+    output_fps: 10
     width: 1280
     height: 720
 
@@ -50,6 +57,14 @@ recording:
   output_dir: "/recordings"
   video_format: "mp4"
   codec: "mp4v"
+  fallback_codecs:
+    - "mp4v"
+    - "XVID"
+    - "MJPG"
   reconnect_delay_seconds: 10
+  reconnect_delay_max_seconds: 60
   max_reconnect_attempts: 0
+  startup_frame_timeout_seconds: 20
+  stale_stream_timeout_seconds: 12
+  min_disk_free_gb: 1.0
   log_level: "INFO"
